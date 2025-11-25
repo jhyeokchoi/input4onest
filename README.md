@@ -1,6 +1,6 @@
-# input4onest
+# Input4onest
 
-**input4onest** is a Python script designed to generate input files for [ONEST](https://github.com/jhyeokchoi/ONEST) (Optimization of NMR Ensemble Structure) by converting modified Sparky CEST (Chemical Exchange Saturation Transfer) data.
+**Input4onest** is a Python script designed to generate input files for [ONEST](https://github.com/jhyeokchoi/ONEST) (Optimized Novel Exchange Saturation Transfer) by converting modified Sparky data.
 
 ## Features
 - **ONEST Compatibility**: Converts tab-separated values (TSV) from Sparky into the specific format required by ONEST.
