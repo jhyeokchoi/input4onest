@@ -1,137 +1,307 @@
 #!/usr/bin/env python3
-"""
-Made by Joonhyeok Choi 2023.05.25
-Refactored by Antigravity 2025.11.23
-Converting modified sparky CEST data to ONEST input format
-"""
+"""Convert modified Sparky CEST data to the ONEST input format."""
 
-import pandas as pd
-import csv
+from __future__ import annotations
+
 import argparse
+import csv
+import math
+import os
+import re
+import stat
+import statistics
 import sys
-from typing import List, Optional
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Sequence
 
-def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Converting modified sparky CEST data to ONEST input format')
-    parser.add_argument('-f', '--file', type=str, help='Input file path', required=True)
-    parser.add_argument('-o', '--output', type=str, help='Output file path', required=True)
-    parser.add_argument('-frq', '--frequency', type=float, help='Nitrogen Frequency (MHz) [Default = 80.12]', default=80.12)
-    parser.add_argument('-sf', '--sat_freq', type=float, help='Saturation Frequency (Hz) [Default = 15]', default=15.0)
-    parser.add_argument('-mix', '--mixing_time', type=float, help='Mixing Time of CEST (s) [Default = 0.4]', default=0.4)
-    parser.add_argument('-r2a', '--ini_R2a', type=float, help='Initial value of R2a (s) [Default = 25]', default=25.0)
-    parser.add_argument('-r2b', '--ini_R2b', type=float, help='Initial value of R2b (s) [Default = 0]', default=0.0)
-    parser.add_argument('-dw', '--ini_dw', type=float, help='Initial value of dw (s) [Default = 0]', default=0.0)
-    
+
+RESIDUE_PATTERN = re.compile(r"^([A-Za-z]+)(-?\d+)$")
+EDGE_POINT_COUNT = 9
+
+
+class ConversionError(Exception):
+    """Raised when the input or requested conversion is invalid."""
+
+
+@dataclass(frozen=True)
+class ResidueRecord:
+    name: str
+    intensities: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class CestData:
+    offsets: tuple[float, ...]
+    records: tuple[ResidueRecord, ...]
+
+
+def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Convert modified Sparky CEST data to ONEST input format"
+    )
+    parser.add_argument("-f", "--file", required=True, help="Input TSV file")
+    parser.add_argument("-o", "--output", required=True, help="Output file")
+    parser.add_argument(
+        "-frq", "--frequency", type=float, default=80.12,
+        help="Nitrogen frequency in MHz (default: 80.12)",
+    )
+    parser.add_argument(
+        "-sf", "--sat_freq", type=float, default=15.0,
+        help="Saturation frequency in Hz (default: 15)",
+    )
+    parser.add_argument(
+        "-mix", "--mixing_time", type=float, default=0.4,
+        help="CEST mixing time in seconds (default: 0.4)",
+    )
+    parser.add_argument(
+        "-r2a", "--ini_R2a", type=float, default=25.0,
+        help="Initial R2a value (default: 25)",
+    )
+    parser.add_argument(
+        "-r2b", "--ini_R2b", type=float, default=0.0,
+        help="Initial R2b value (default: 0)",
+    )
+    parser.add_argument(
+        "-dw", "--ini_dw", type=float, default=0.0,
+        help="Initial dw value (default: 0)",
+    )
+
     group = parser.add_mutually_exclusive_group()
-    group.add_argument('-s', '--select_number', nargs='+', type=float, help='Residue number list from the input data list')
-    group.add_argument('-sn', '--select_name', nargs='+', type=str, help='Residue name list from the input data list')
-    
-    return parser.parse_args()
+    group.add_argument(
+        "-s", "--select_number", nargs="+", type=int,
+        help="Residue numbers to include, for example: 10 12 15",
+    )
+    group.add_argument(
+        "-sn", "--select_name", nargs="+",
+        help="Residue IDs or residue codes to include, for example: I36 Q49 or I Q",
+    )
+    return parser.parse_args(argv)
 
-def filter_data(data_ori: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+
+def _finite_float(value: str, location: str) -> float:
+    try:
+        result = float(value.strip())
+    except ValueError as exc:
+        raise ConversionError(f"{location} must be numeric; got {value!r}") from exc
+    if not math.isfinite(result):
+        raise ConversionError(f"{location} must be finite; got {value!r}")
+    return result
+
+
+def read_cest_data(path: str | Path) -> CestData:
+    input_path = Path(path)
+    try:
+        with input_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.reader(handle, delimiter="\t"))
+    except FileNotFoundError as exc:
+        raise ConversionError(f"input file not found: {input_path}") from exc
+    except (OSError, UnicodeError) as exc:
+        raise ConversionError(f"cannot read input file {input_path}: {exc}") from exc
+
+    if not rows or not any(cell.strip() for cell in rows[0]):
+        raise ConversionError("input file is empty or has no header")
+
+    header = rows[0]
+    if len(header) < 3:
+        raise ConversionError(
+            "input must contain a residue column and at least two offset columns"
+        )
+    if not header[0].strip():
+        raise ConversionError("the first header cell (residue column) is empty")
+
+    raw_offsets = [cell.strip() for cell in header[1:]]
+    if any(not value for value in raw_offsets):
+        raise ConversionError("offset headers cannot be empty")
+    offsets = tuple(
+        _finite_float(value, f"offset header at column {index}")
+        for index, value in enumerate(raw_offsets, start=2)
+    )
+    if len(set(offsets)) != len(offsets):
+        raise ConversionError("offset headers must be unique")
+
+    records: list[ResidueRecord] = []
+    seen_residues: set[str] = set()
+    expected_columns = len(header)
+    for row_number, row in enumerate(rows[1:], start=2):
+        if not row or not any(cell.strip() for cell in row):
+            continue
+        if len(row) != expected_columns:
+            raise ConversionError(
+                f"row {row_number} has {len(row)} columns; expected {expected_columns}"
+            )
+        residue = row[0].strip()
+        if not residue:
+            raise ConversionError(f"row {row_number} has an empty residue ID")
+        residue_key = residue.casefold()
+        if residue_key in seen_residues:
+            raise ConversionError(f"duplicate residue ID at row {row_number}: {residue}")
+        seen_residues.add(residue_key)
+
+        intensities = tuple(
+            _finite_float(value, f"intensity at row {row_number}, column {column}")
+            for column, value in enumerate(row[1:], start=2)
+        )
+        records.append(ResidueRecord(residue, intensities))
+
+    if not records:
+        raise ConversionError("input contains no residue data rows")
+    return CestData(offsets, tuple(records))
+
+
+def _residue_parts(residue: str) -> tuple[str, int] | None:
+    match = RESIDUE_PATTERN.fullmatch(residue)
+    if match is None:
+        return None
+    return match.group(1), int(match.group(2))
+
+
+def filter_data(data: CestData, args: argparse.Namespace) -> CestData:
     if args.select_number:
-        # Adjust for 0-based indexing if input is 1-based residue numbers
-        # Original code: [x-1 for x in args.select_number]
-        selected_indices = [int(x) - 1 for x in args.select_number]
-        # Validate indices
-        valid_indices = [i for i in selected_indices if 0 <= i < len(data_ori)]
-        if len(valid_indices) != len(selected_indices):
-             print(f"Warning: Some selected numbers are out of range. Using valid ones only.")
-        return data_ori.iloc[valid_indices, :]
-    
-    elif args.select_name:
-        indices = []
-        for i, row in data_ori.iterrows():
-            row_str = row.astype(str)
-            for name in args.select_name:
-                # Check if name is in any column of the row
-                if row_str.str.contains(name).any():
-                    indices.append(i)
-                    break # Avoid adding same row multiple times if it matches multiple names
-        
-        # Original code logic: checks if found count matches requested count. 
-        # This is slightly flawed if one name matches multiple rows or multiple names match one row.
-        # But we'll keep the filtering logic.
-        
-        if not indices:
-             print("Please check residue name!\nInput name:", args.select_name)
-             sys.exit(1)
-             
-        return data_ori.iloc[indices, :]
-    
-    else:
-        return data_ori
+        requested = set(args.select_number)
+        matched_numbers: set[int] = set()
+        selected: list[ResidueRecord] = []
+        unparseable: list[str] = []
+        for record in data.records:
+            parts = _residue_parts(record.name)
+            if parts is None:
+                unparseable.append(record.name)
+                continue
+            number = parts[1]
+            if number in requested:
+                selected.append(record)
+                matched_numbers.add(number)
 
-def write_onest_input(data: pd.DataFrame, args: argparse.Namespace):
+        missing = sorted(requested - matched_numbers)
+        if missing:
+            detail = (
+                f"; unrecognized residue IDs: {', '.join(unparseable)}"
+                if unparseable
+                else ""
+            )
+            raise ConversionError(f"residue number(s) not found: {missing}{detail}")
+        return CestData(data.offsets, tuple(selected))
+
+    if args.select_name:
+        requested = {name.casefold(): name for name in args.select_name}
+        matched_queries: set[str] = set()
+        selected = []
+        for record in data.records:
+            residue_key = record.name.casefold()
+            parts = _residue_parts(record.name)
+            code_key = parts[0].casefold() if parts else None
+            record_matches = {
+                query for query in requested
+                if query == residue_key or (code_key is not None and query == code_key)
+            }
+            if record_matches:
+                selected.append(record)
+                matched_queries.update(record_matches)
+
+        missing = [requested[key] for key in requested if key not in matched_queries]
+        if missing:
+            raise ConversionError(f"residue name(s) not found: {missing}")
+        return CestData(data.offsets, tuple(selected))
+
+    return data
+
+
+def estimate_error(intensities: Sequence[float]) -> float:
+    """Estimate noise from spectrum edges, avoiding overlapping edge windows."""
+    if len(intensities) < 2:
+        raise ConversionError("at least two intensity points are required")
+    if len(intensities) >= EDGE_POINT_COUNT * 2:
+        left = statistics.stdev(intensities[:EDGE_POINT_COUNT])
+        right = statistics.stdev(intensities[-EDGE_POINT_COUNT:])
+        return min(left, right)
+    return statistics.stdev(intensities)
+
+
+def validate_parameters(args: argparse.Namespace) -> None:
+    positive = {
+        "frequency": args.frequency,
+        "saturation frequency": args.sat_freq,
+        "mixing time": args.mixing_time,
+    }
+    for name, value in positive.items():
+        if not math.isfinite(value) or value <= 0:
+            raise ConversionError(f"{name} must be a positive finite number")
+    initial_values = {
+        "R2a": args.ini_R2a,
+        "R2b": args.ini_R2b,
+        "dw": args.ini_dw,
+    }
+    for name, value in initial_values.items():
+        if not math.isfinite(value):
+            raise ConversionError(f"initial {name} must be finite")
+    if args.ini_R2a < 0 or args.ini_R2b < 0:
+        raise ConversionError("initial R2a and R2b cannot be negative")
+
+
+def _write_rows(handle, data: CestData, args: argparse.Namespace) -> None:
+    writer = csv.writer(handle, delimiter="\t")
+    writer.writerow([args.frequency])
+    writer.writerow([args.mixing_time])
+    writer.writerow([args.sat_freq, args.sat_freq / 10])
+    writer.writerow(["#offset(ppm)     Intensity     error"])
+
+    for record in data.records:
+        error = estimate_error(record.intensities)
+        writer.writerow(
+            ["#", record.name, "R2a:", args.ini_R2a, "R2b:", args.ini_R2b, "dw:", args.ini_dw]
+        )
+        for offset, intensity in zip(data.offsets, record.intensities):
+            writer.writerow([offset, intensity, error])
+
+
+def write_onest_input(data: CestData, args: argparse.Namespace) -> None:
+    """Write a complete output atomically so failures do not leave partial files."""
+    output_path = Path(args.output)
+    temporary_path: Path | None = None
     try:
-        with open(args.output, 'w', newline='') as f:
-            out = csv.writer(f, delimiter='\t')
-            
-            # Write Header
-            out.writerow([args.frequency])
-            out.writerow([args.mixing_time])
-            out.writerow([args.sat_freq, args.sat_freq / 10])
-            out.writerow(['#offset(ppm)     Intensity     error'])
-            
-            # Write Data
-            num_rows, num_cols = data.shape
-            # Assuming first column is residue name/ID, and rest are data points
-            # data.columns[1:] are frequencies
-            
-            frequencies = data.columns[1:]
-            
-            for i in range(num_rows):
-                row = data.iloc[i]
-                residue_name = row.iloc[0]
-                intensities = row.iloc[1:].values
-                
-                # Calculate error
-                # Original logic: std of first 9 points vs last 9 points (excluding very last?)
-                # The original slicing was [1:10] (9 points) and [-10:-1] (9 points).
-                # We need to be careful if data is short.
-                
-                if len(intensities) >= 10:
-                    err_std1 = intensities[0:9].std(ddof=1)
-                    err_std2 = intensities[-10:-1].std(ddof=1) 
-                    # Let's stick to original logic but make it safe
-                    error = min(err_std1, err_std2)
-                else:
-                    # Fallback for short data
-                    error = intensities.std(ddof=1)
-                
-                # Write residue header line
-                out.writerow(['#', residue_name, 'R2a:', args.ini_R2a, 'R2b:', args.ini_R2b, 'dw:', args.ini_dw])
-                
-                # Write intensity data
-                for j, freq in enumerate(frequencies):
-                    try:
-                        freq_val = float(freq)
-                        intensity = intensities[j]
-                        out.writerow([freq_val, intensity, error])
-                    except ValueError:
-                        continue
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_mode = (
+            stat.S_IMODE(output_path.stat().st_mode) if output_path.exists() else 0o644
+        )
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            _write_rows(handle, data, args)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary_path.chmod(output_mode)
+        os.replace(temporary_path, output_path)
+    except OSError as exc:
+        raise ConversionError(f"cannot write output file {output_path}: {exc}") from exc
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
 
-    except IOError as e:
-        print(f"Error writing to file {args.output}: {e}")
-        sys.exit(1)
 
-def main():
-    args = parse_arguments()
-    
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_arguments(argv)
     try:
-        data_ori = pd.read_csv(filepath_or_buffer=args.file, delimiter='\t')
-    except FileNotFoundError:
-        print(f"Error: Input file '{args.file}' not found.")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error reading input file: {e}")
-        sys.exit(1)
+        validate_parameters(args)
+        data = filter_data(read_cest_data(args.file), args)
+        write_onest_input(data, args)
+    except ConversionError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
-    data = filter_data(data_ori, args)
-    
-    write_onest_input(data, args)
-    
-    print("The conversion process is complete. Output file: ", args.output)
+    print(f"The conversion process is complete. Output file: {args.output}")
+    return 0
 
-if __name__ == '__main__':
-    main()
+
+if __name__ == "__main__":
+    sys.exit(main())
